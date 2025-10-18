@@ -1,4 +1,4 @@
-// JaxPlays Photos: one filename prompt, reliable WEBP save with silent-then-dialog fallback
+// JaxPlays Photos: single prompt for JPG, WEBP mirrors name; robust filename handling
 
 const MENU_PARENT = "jaxplays_photos_parent";
 
@@ -28,7 +28,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const jpgBlob = await convertBlob(imgBlob, "image/jpeg", 0.92);
     const webpBlob = await convertBlob(imgBlob, "image/webp", 0.92);
 
-    // 1) Show one dialog for JPG, capture chosen filename
+    // 1) Prompt once for JPG
     const jpgSuggested = `${action.jpgDir}/${suggestedBase}.jpg`;
     const chosenJpgPath = await saveWithPromptAndGetPath(jpgBlob, jpgSuggested);
     if (!chosenJpgPath) {
@@ -36,14 +36,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       return;
     }
 
-    const base = getFilenameWithoutExt(chosenJpgPath);
+    // Get safe base name from the actual chosen file
+    const rawBase = getFilenameWithoutExt(chosenJpgPath);
+    const base = sanitize(rawBase) || sanitize(suggestedBase) || `image-${Date.now()}`;
 
-    // 2) Try silent WEBP save
+    // 2) Try silent WEBP save with the same base
     const webpSuggested = `${action.webpDir}/${base}.webp`;
     const silentOk = await saveSilentlyWithConfirm(webpBlob, webpSuggested);
 
     if (!silentOk) {
-      // Fallback: show a dialog for WEBP with the same base and folder suggestion
+      // Fallback: prompt for WEBP with same suggested folder and base
       await saveWithPromptAndGetPath(webpBlob, webpSuggested);
     }
 
@@ -77,12 +79,20 @@ function deriveNames(srcUrl, pageUrl) {
   }
 }
 
+// Keep letters, numbers, dot, underscore, hyphen; collapse repeats; limit length
 function sanitize(s) {
-  return s.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/-+/g, "-").slice(0, 120);
+  return String(s).normalize("NFKC")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "")
+    .slice(0, 120);
 }
 
+// Works for absolute paths or Chrome’s internal paths
 function getFilenameWithoutExt(fullPath) {
-  const name = fullPath.split("/").pop() || fullPath;
+  if (!fullPath) return "";
+  const norm = fullPath.replace(/\\/g, "/");
+  const name = norm.split("/").pop() || norm;
   return name.replace(/\.[^.]+$/, "");
 }
 
@@ -133,7 +143,6 @@ async function saveSilentlyWithConfirm(blob, path) {
       conflictAction: "uniquify",
       saveAs: false
     });
-    // Confirm Chrome accepted it by checking status shortly after
     const ok = await waitForBegin(id, 5000);
     if (!ok) {
       console.warn("Silent save did not start within timeout");
@@ -142,13 +151,11 @@ async function saveSilentlyWithConfirm(blob, path) {
     return true;
   } catch (err) {
     console.warn("Silent save blocked or failed:", err);
-    // Most common cause is Chrome blocking multiple automatic downloads
-    // User can allow them in Chrome settings if desired
     return false;
   }
 }
 
-// Promisified chrome.downloads.download
+// Promisified chrome.downloads APIs
 function downloadsDownload(options) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(options, id => {
@@ -179,7 +186,6 @@ async function waitForFilenameOrComplete(id, timeoutMs) {
         resolve(delta.filename.current.replace(/\\/g, "/"));
       } else if (delta.state && delta.state.current === "complete") {
         chrome.downloads.onChanged.removeListener(onChanged);
-        // If we missed the filename event, read from search
         downloadsSearch({ id }).then(items => {
           resolve((items?.[0]?.filename || "").replace(/\\/g, "/"));
         }).catch(() => resolve(""));
@@ -191,7 +197,6 @@ async function waitForFilenameOrComplete(id, timeoutMs) {
 
     chrome.downloads.onChanged.addListener(onChanged);
 
-    // Safety timeout
     const t = setInterval(async () => {
       if (Date.now() - start > timeoutMs) {
         chrome.downloads.onChanged.removeListener(onChanged);
@@ -216,10 +221,30 @@ async function waitForBegin(id, timeoutMs) {
 }
 
 function notify(title, message) {
-  chrome.notifications.create({
-    type: "basic",
-    iconUrl: "icons/icon128.png",
-    title,
-    message
-  });
+  // Try icon128, then 48, then create without icon if both fail
+  const tryCreate = (iconPath) =>
+    new Promise((resolve) => {
+      const opts = {
+        type: "basic",
+        title,
+        message
+      };
+      if (iconPath) opts.iconUrl = chrome.runtime.getURL(iconPath);
+      chrome.notifications.create(opts, () => {
+        // Swallow notification image errors
+        // (Chrome reports them via lastError, not throw)
+        // eslint-disable-next-line no-unused-expressions
+        chrome.runtime.lastError;
+        resolve(Boolean(!chrome.runtime.lastError));
+      });
+    });
+
+  (async () => {
+    // Try icon128
+    if (await tryCreate("icons/icon128.png")) return;
+    // Try icon48
+    if (await tryCreate("icons/icon48.png")) return;
+    // Try without icon
+    await tryCreate(null);
+  })();
 }
