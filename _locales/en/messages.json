@@ -1,12 +1,12 @@
 {
 	"extName": {
-		"message": "Save image as Type"
+		"message": "JaxPlays Photos"
 	},
 	"extShortName": {
-		"message": "SaveImageAs"
+		"message": "JaxPlays Photos"
 	},
 	"extDescription": {
-		"message": "Save image as PNG, JPG or WebP by context menu on image."
+		"message": "Right-click any image to save JPG and WebP into JaxPlays Hugo folders for headshots, posters, and photos."
 	},
 	"Save_as": {
 		"message": "Save as $FORMAT$",
