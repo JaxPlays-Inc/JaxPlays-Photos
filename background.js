@@ -133,26 +133,30 @@ async function saveWithPromptAndGetPath(blob, suggestedPath) {
   return filename || null;
 }
 
-// Try silent save, confirm it actually started
+// Try silent save, ensure it actually completes, fallback if not
 async function saveSilentlyWithConfirm(blob, path) {
+  let id;
   try {
     const dataUrl = await blobToDataUrl(blob);
-    const id = await downloadsDownload({
+    id = await downloadsDownload({
       url: dataUrl,
       filename: path,
       conflictAction: "uniquify",
       saveAs: false
     });
-    const ok = await waitForBegin(id, 5000);
-    if (!ok) {
-      console.warn("Silent save did not start within timeout");
-      return false;
-    }
-    return true;
   } catch (err) {
     console.warn("Silent save blocked or failed:", err);
     return false;
   }
+
+  const outcome = await waitForCompletion(id, 20000);
+  if (!outcome.success) {
+    console.warn("Silent save did not complete:", outcome.reason || "unknown reason");
+    await downloadsCancel(id);
+    return false;
+  }
+
+  return true;
 }
 
 // Promisified chrome.downloads APIs
@@ -174,50 +178,118 @@ function downloadsSearch(query) {
   });
 }
 
+function downloadsCancel(id) {
+  return new Promise(resolve => {
+    chrome.downloads.cancel(id, () => {
+      // Ignore cancel errors; return best-effort boolean
+      const ok = !chrome.runtime.lastError;
+      resolve(ok);
+    });
+  });
+}
+
 // Wait until Chrome reports the chosen filename or completes
 async function waitForFilenameOrComplete(id, timeoutMs) {
   return new Promise(resolve => {
     const start = Date.now();
+    let settled = false;
+    let timer;
+
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      if (timer) clearInterval(timer);
+      resolve(value);
+    };
 
     const onChanged = delta => {
       if (delta.id !== id) return;
       if (delta.filename && delta.filename.current) {
-        chrome.downloads.onChanged.removeListener(onChanged);
-        resolve(delta.filename.current.replace(/\\/g, "/"));
+        finish(delta.filename.current.replace(/\\/g, "/"));
       } else if (delta.state && delta.state.current === "complete") {
-        chrome.downloads.onChanged.removeListener(onChanged);
         downloadsSearch({ id }).then(items => {
-          resolve((items?.[0]?.filename || "").replace(/\\/g, "/"));
-        }).catch(() => resolve(""));
+          finish((items?.[0]?.filename || "").replace(/\\/g, "/"));
+        }).catch(() => finish(""));
       } else if (delta.state && delta.state.current === "interrupted") {
-        chrome.downloads.onChanged.removeListener(onChanged);
-        resolve("");
+        finish("");
       }
     };
 
     chrome.downloads.onChanged.addListener(onChanged);
 
-    const t = setInterval(async () => {
+    timer = setInterval(async () => {
       if (Date.now() - start > timeoutMs) {
-        chrome.downloads.onChanged.removeListener(onChanged);
         const items = await downloadsSearch({ id }).catch(() => []);
-        resolve((items?.[0]?.filename || "").replace(/\\/g, "/"));
-        clearInterval(t);
+        finish((items?.[0]?.filename || "").replace(/\\/g, "/"));
       }
     }, 400);
   });
 }
 
-// Wait for a download to at least begin
-async function waitForBegin(id, timeoutMs) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const items = await downloadsSearch({ id }).catch(() => []);
-    const it = items?.[0];
-    if (it && (it.state === "in_progress" || it.state === "complete")) return true;
-    await new Promise(r => setTimeout(r, 200));
-  }
-  return false;
+async function waitForCompletion(id, timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    let settled = false;
+    let timer;
+
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      if (timer) clearInterval(timer);
+      resolve(result);
+    };
+
+    const normalizePath = path => (path || "").replace(/\\/g, "/");
+
+    const checkItem = async (final = false) => {
+      const items = await downloadsSearch({ id }).catch(() => []);
+      const item = items?.[0];
+      if (!item) return final ? { success: false, reason: "missing", filename: "" } : null;
+      if (item.state === "complete") return { success: true, filename: normalizePath(item.filename) };
+      if (item.state === "interrupted") return { success: false, reason: item.error || "interrupted", filename: normalizePath(item.filename) };
+      if (item.danger && item.danger !== "safe") return { success: false, reason: `danger-${item.danger}`, filename: normalizePath(item.filename) };
+      if (final) return { success: false, reason: item.state || "timeout", filename: normalizePath(item.filename) };
+      return null;
+    };
+
+    const onChanged = delta => {
+      if (delta.id !== id) return;
+      if (delta.state) {
+        const state = delta.state.current;
+        if (state === "complete") {
+          finish({ success: true, filename: normalizePath(delta.filename?.current) });
+          return;
+        }
+        if (state === "interrupted") {
+          finish({ success: false, reason: delta.error?.current || "interrupted", filename: normalizePath(delta.filename?.current) });
+          return;
+        }
+      }
+      if (delta.danger && delta.danger.current && delta.danger.current !== "safe") {
+        finish({ success: false, reason: `danger-${delta.danger.current}`, filename: normalizePath(delta.filename?.current) });
+      }
+    };
+
+    chrome.downloads.onChanged.addListener(onChanged);
+
+    (async () => {
+      const immediate = await checkItem();
+      if (immediate) {
+        finish(immediate);
+        return;
+      }
+
+      timer = setInterval(async () => {
+        if (settled) return;
+        if (Date.now() - start > timeoutMs) {
+          const finalStatus = await checkItem(true);
+          finish(finalStatus || { success: false, reason: "timeout", filename: "" });
+        }
+      }, 400);
+    })();
+  });
 }
 
 function notify(title, message) {
