@@ -2,10 +2,36 @@
 
 const MENU_PARENT = "jaxplays_photos_parent";
 
+// Absolute paths for the renamed site; fallbacks stay relative to Chrome's download dir
+const SITE_ROOT = "Sites/jaxplays.org/";
+const ASSET_ROOT = `${SITE_ROOT}/assets/media`;
+const STATIC_ROOT = `${SITE_ROOT}/static/media`;
+
 const ACTIONS = [
-  { id: "save_headshot", title: "Save a Headshot", jpgDir: "assets/media/headshots", webpDir: "static/media/headshots" },
-  { id: "save_poster",   title: "Save a Poster",   jpgDir: "assets/media/posters",   webpDir: "static/media/posters" },
-  { id: "save_photo",    title: "Save a Photo",    jpgDir: "assets/media/photos",    webpDir: "static/media/photos" }
+  {
+    id: "save_headshot",
+    title: "Save a Headshot",
+    jpgDir: `${ASSET_ROOT}/headshots`,
+    webpDir: `${STATIC_ROOT}/headshots`,
+    jpgFallback: "assets/media/headshots",
+    webpFallback: "static/media/headshots"
+  },
+  {
+    id: "save_poster",
+    title: "Save a Poster",
+    jpgDir: `${ASSET_ROOT}/posters`,
+    webpDir: `${STATIC_ROOT}/posters`,
+    jpgFallback: "assets/media/posters",
+    webpFallback: "static/media/posters"
+  },
+  {
+    id: "save_photo",
+    title: "Save a Photo",
+    jpgDir: `${ASSET_ROOT}/photos`,
+    webpDir: `${STATIC_ROOT}/photos`,
+    jpgFallback: "assets/media/photos",
+    webpFallback: "static/media/photos"
+  }
 ];
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -30,7 +56,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
     // 1) Prompt once for JPG
     const jpgSuggested = `${action.jpgDir}/${suggestedBase}.jpg`;
-    const chosenJpgPath = await saveWithPromptAndGetPath(jpgBlob, jpgSuggested);
+    const jpgFallback = action.jpgFallback ? `${action.jpgFallback}/${suggestedBase}.jpg` : jpgSuggested;
+    const chosenJpgPath = await saveWithPromptAndGetPath(jpgBlob, jpgSuggested, jpgFallback);
     if (!chosenJpgPath) {
       notify("Canceled", "Save dialog closed without saving");
       return;
@@ -42,11 +69,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
     // 2) Try silent WEBP save with the same base
     const webpSuggested = `${action.webpDir}/${base}.webp`;
-    const silentOk = await saveSilentlyWithConfirm(webpBlob, webpSuggested);
+    const webpFallback = action.webpFallback ? `${action.webpFallback}/${base}.webp` : webpSuggested;
+    const silentOk = await saveSilentlyWithConfirm(webpBlob, webpSuggested, webpFallback);
 
     if (!silentOk) {
       // Fallback: prompt for WEBP with same suggested folder and base
-      await saveWithPromptAndGetPath(webpBlob, webpSuggested);
+      await saveWithPromptAndGetPath(webpBlob, webpSuggested, webpFallback);
     }
 
     notify("Saved", `${action.title}: ${base}.jpg and ${base}.webp`);
@@ -117,46 +145,68 @@ function blobToDataUrl(blob) {
 }
 
 // One dialog, return the actual filename Chrome used
-async function saveWithPromptAndGetPath(blob, suggestedPath) {
+async function saveWithPromptAndGetPath(blob, primaryPath, fallbackPath) {
   const dataUrl = await blobToDataUrl(blob);
-  const id = await downloadsDownload({
-    url: dataUrl,
-    filename: suggestedPath,
-    conflictAction: "uniquify",
-    saveAs: true
-  }).catch(err => {
-    console.warn("download failed:", err);
-    return null;
-  });
-  if (!id) return null;
-  const filename = await waitForFilenameOrComplete(id, 10000);
-  return filename || null;
-}
 
-// Try silent save, ensure it actually completes, fallback if not
-async function saveSilentlyWithConfirm(blob, path) {
-  let id;
-  try {
-    const dataUrl = await blobToDataUrl(blob);
-    id = await downloadsDownload({
+  const attempt = async (path) => {
+    const id = await downloadsDownload({
       url: dataUrl,
       filename: path,
       conflictAction: "uniquify",
-      saveAs: false
+      saveAs: true
+    }).catch(err => {
+      console.warn("download failed:", err);
+      return null;
     });
-  } catch (err) {
-    console.warn("Silent save blocked or failed:", err);
-    return false;
+    if (!id) return null;
+    const filename = await waitForFilenameOrComplete(id, 10000);
+    return filename || null;
+  };
+
+  let filename = await attempt(primaryPath);
+  if (!filename && fallbackPath && fallbackPath !== primaryPath) {
+    filename = await attempt(fallbackPath);
+  }
+  return filename;
+}
+
+// Try silent save, ensure it actually completes, fallback if not
+async function saveSilentlyWithConfirm(blob, primaryPath, fallbackPath) {
+  const dataUrl = await blobToDataUrl(blob);
+
+  const attempt = async (path) => {
+    let id;
+    try {
+      id = await downloadsDownload({
+        url: dataUrl,
+        filename: path,
+        conflictAction: "uniquify",
+        saveAs: false
+      });
+    } catch (err) {
+      console.warn("Silent save blocked or failed:", err);
+      return { started: false, success: false };
+    }
+
+    const outcome = await waitForCompletion(id, 20000);
+    if (!outcome.success) {
+      console.warn("Silent save did not complete:", outcome.reason || "unknown reason");
+      await downloadsCancel(id);
+      return { started: true, success: false };
+    }
+
+    return { started: true, success: true };
+  };
+
+  let result = await attempt(primaryPath);
+  if (result.success) return true;
+
+  if (!result.started && fallbackPath && fallbackPath !== primaryPath) {
+    result = await attempt(fallbackPath);
+    if (result.success) return true;
   }
 
-  const outcome = await waitForCompletion(id, 20000);
-  if (!outcome.success) {
-    console.warn("Silent save did not complete:", outcome.reason || "unknown reason");
-    await downloadsCancel(id);
-    return false;
-  }
-
-  return true;
+  return false;
 }
 
 // Promisified chrome.downloads APIs

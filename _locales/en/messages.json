@@ -6,7 +6,7 @@
 		"message": "JaxPlays Photos"
 	},
 	"extDescription": {
-		"message": "Right-click any image to save JPG and WebP into JaxPlays Hugo folders for headshots, posters, and photos."
+		"message": "Right-click any image to save JPG and WebP into JaxPlays local folders for headshots, posters, and photos."
 	},
 	"Save_as": {
 		"message": "Save as $FORMAT$",
