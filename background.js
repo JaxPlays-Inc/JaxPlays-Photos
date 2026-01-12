@@ -2,35 +2,26 @@
 
 const MENU_PARENT = "jaxplays_photos_parent";
 
-// Absolute paths for the renamed site; fallbacks stay relative to Chrome's download dir
-const SITE_ROOT = "/Users/rayhollister/Sites/jaxplays.org";
-const ASSET_ROOT = `${SITE_ROOT}/assets/media`;
-const STATIC_ROOT = `${SITE_ROOT}/static/media`;
-
+// Paths are RELATIVE to Chrome's configured download directory
+// Set Chrome's download location to: /Users/rayhollister/Sites/jaxplays.org
 const ACTIONS = [
   {
     id: "save_headshot",
     title: "Save a Headshot",
-    jpgDir: `${ASSET_ROOT}/headshots`,
-    webpDir: `${STATIC_ROOT}/headshots`,
-    jpgFallback: "assets/media/headshots",
-    webpFallback: "static/media/headshots"
+    jpgDir: "assets/media/headshots",
+    webpDir: "static/media/headshots"
   },
   {
     id: "save_poster",
     title: "Save a Poster",
-    jpgDir: `${ASSET_ROOT}/posters`,
-    webpDir: `${STATIC_ROOT}/posters`,
-    jpgFallback: "assets/media/posters",
-    webpFallback: "static/media/posters"
+    jpgDir: "assets/media/posters",
+    webpDir: "static/media/posters"
   },
   {
     id: "save_photo",
     title: "Save a Photo",
-    jpgDir: `${ASSET_ROOT}/photos`,
-    webpDir: `${STATIC_ROOT}/photos`,
-    jpgFallback: "assets/media/photos",
-    webpFallback: "static/media/photos"
+    jpgDir: "assets/media/photos",
+    webpDir: "static/media/photos"
   }
 ];
 
@@ -48,41 +39,70 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   try {
     const imgBlob = await fetchImageAsBlob(info.srcUrl);
-    const { baseName: suggestedBase } = deriveNames(info.srcUrl, tab?.url);
+    const { baseName: suggestedBase, extension: originalExt } = deriveNames(info.srcUrl, imgBlob.type);
 
-    // Convert once each
-    const jpgBlob = await convertBlob(imgBlob, "image/jpeg", 0.92);
-    const webpBlob = await convertBlob(imgBlob, "image/webp", 0.92);
-
-    // 1) Prompt once for JPG
-    const jpgSuggested = `${action.jpgDir}/${suggestedBase}.jpg`;
-    const jpgFallback = action.jpgFallback ? `${action.jpgFallback}/${suggestedBase}.jpg` : jpgSuggested;
-    const chosenJpgPath = await saveWithPromptAndGetPath(jpgBlob, jpgSuggested, jpgFallback);
-    if (!chosenJpgPath) {
-      notify("Canceled", "Save dialog closed without saving");
+    // Prompt user for filename via injected script
+    const filename = await promptForFilename(tab.id, suggestedBase);
+    if (!filename) {
+      notify("Canceled", "No filename provided");
       return;
     }
 
-    // Get safe base name from the actual chosen file
-    const rawBase = getFilenameWithoutExt(chosenJpgPath);
-    const base = sanitize(rawBase) || sanitize(suggestedBase) || `image-${Date.now()}`;
+    const base = sanitize(filename) || sanitize(suggestedBase) || `image-${Date.now()}`;
 
-    // 2) Try silent WEBP save with the same base
-    const webpSuggested = `${action.webpDir}/${base}.webp`;
-    const webpFallback = action.webpFallback ? `${action.webpFallback}/${base}.webp` : webpSuggested;
-    const silentOk = await saveSilentlyWithConfirm(webpBlob, webpSuggested, webpFallback);
+    // Convert to WebP for static folder
+    const webpBlob = await convertBlob(imgBlob, "image/webp", 0.92);
 
-    if (!silentOk) {
-      // Fallback: prompt for WEBP with same suggested folder and base
-      await saveWithPromptAndGetPath(webpBlob, webpSuggested, webpFallback);
+    // Save original format to assets folder, WebP to static folder
+    const originalPath = `${action.jpgDir}/${base}.${originalExt}`;
+    const webpPath = `${action.webpDir}/${base}.webp`;
+
+    console.log("Saving original to:", originalPath);
+    console.log("Saving webp to:", webpPath);
+
+    // Convert blobs to data URLs for passing to content script
+    const [originalDataUrl, webpDataUrl] = await Promise.all([
+      blobToDataUrl(imgBlob),
+      blobToDataUrl(webpBlob)
+    ]);
+
+    // Use content script to trigger downloads (anchor tag method respects filename)
+    const [originalOk, webpOk] = await Promise.all([
+      downloadViaContentScript(tab.id, originalDataUrl, `${base}.${originalExt}`, originalPath),
+      downloadViaContentScript(tab.id, webpDataUrl, `${base}.webp`, webpPath)
+    ]);
+
+    if (originalOk && webpOk) {
+      notify("Saved", `${base}.${originalExt} and ${base}.webp`);
+    } else if (originalOk) {
+      notify("Partial Save", `Original saved, WebP failed: ${base}`);
+    } else if (webpOk) {
+      notify("Partial Save", `WebP saved, original failed: ${base}`);
+    } else {
+      notify("Error", "Both saves failed");
     }
-
-    notify("Saved", `${action.title}: ${base}.jpg and ${base}.webp`);
   } catch (e) {
     console.error("JaxPlays Photos error:", e);
     notify("Error", String(e?.message || e));
   }
 });
+
+// Prompt user for filename using injected script
+async function promptForFilename(tabId, suggestedName) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (suggested) => {
+        return prompt("Enter filename (without extension):", suggested);
+      },
+      args: [suggestedName]
+    });
+    return results?.[0]?.result || null;
+  } catch (err) {
+    console.warn("Could not prompt for filename:", err);
+    return suggestedName; // Fall back to suggested name
+  }
+}
 
 // ---- Helpers ----
 
@@ -92,18 +112,33 @@ async function fetchImageAsBlob(url) {
   return await res.blob();
 }
 
-function deriveNames(srcUrl, pageUrl) {
+function deriveNames(srcUrl, mimeType) {
+  // Map MIME types to extensions
+  const mimeToExt = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+    "image/bmp": "bmp",
+    "image/tiff": "tiff"
+  };
+
   try {
     const u = new URL(srcUrl);
     const leaf = u.pathname.split("/").filter(Boolean).pop() || "image";
+    // Extract extension from URL
+    const urlExtMatch = leaf.match(/\.([a-zA-Z0-9]+)$/);
+    const urlExt = urlExtMatch ? urlExtMatch[1].toLowerCase() : null;
+    // Use MIME type extension, fall back to URL extension, then default to jpg
+    const extension = mimeToExt[mimeType] || urlExt || "jpg";
     const base = leaf.replace(/\.[a-zA-Z0-9]+$/, "");
-    const host = u.host?.split(":")[0] || new URL(pageUrl || "https://x").host;
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const safeBase = sanitize(`${base}-${host}-${ts}`);
-    return { baseName: safeBase };
+    const safeBase = sanitize(base);
+    return { baseName: safeBase || `image-${Date.now()}`, extension };
   } catch {
-    const ts = Date.now();
-    return { baseName: `image-${ts}` };
+    const extension = mimeToExt[mimeType] || "jpg";
+    return { baseName: `image-${Date.now()}`, extension };
   }
 }
 
@@ -144,69 +179,172 @@ function blobToDataUrl(blob) {
   });
 }
 
-// One dialog, return the actual filename Chrome used
-async function saveWithPromptAndGetPath(blob, primaryPath, fallbackPath) {
-  const dataUrl = await blobToDataUrl(blob);
+// Download via content script using anchor tag (respects filename)
+async function downloadViaContentScript(tabId, dataUrl, filename, fullPath) {
+  console.log("downloadViaContentScript:", filename, "->", fullPath);
 
-  const attempt = async (path) => {
-    const id = await downloadsDownload({
-      url: dataUrl,
-      filename: path,
-      conflictAction: "uniquify",
-      saveAs: true
-    }).catch(err => {
-      console.warn("download failed:", err);
-      return null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (dataUrl, filename) => {
+        return new Promise((resolve) => {
+          try {
+            // Convert data URL to blob
+            fetch(dataUrl)
+              .then(res => res.blob())
+              .then(blob => {
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl;
+                a.download = filename;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                // Clean up after a delay
+                setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+                resolve({ success: true });
+              })
+              .catch(err => resolve({ success: false, error: err.message }));
+          } catch (err) {
+            resolve({ success: false, error: err.message });
+          }
+        });
+      },
+      args: [dataUrl, filename]
     });
-    if (!id) return null;
-    const filename = await waitForFilenameOrComplete(id, 10000);
-    return filename || null;
-  };
 
-  let filename = await attempt(primaryPath);
-  if (!filename && fallbackPath && fallbackPath !== primaryPath) {
-    filename = await attempt(fallbackPath);
+    const result = results?.[0]?.result;
+    console.log("Content script result:", result);
+    return result?.success || false;
+  } catch (err) {
+    console.warn("downloadViaContentScript failed:", err);
+    return false;
   }
-  return filename;
 }
 
-// Try silent save, ensure it actually completes, fallback if not
-async function saveSilentlyWithConfirm(blob, primaryPath, fallbackPath) {
+// Save silently using offscreen document for blob URL creation (backup method)
+async function saveSilently(blob, path) {
   const dataUrl = await blobToDataUrl(blob);
+  const cleanPath = path.replace(/^\/+/, '').replace(/\\/g, '/');
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  console.log("saveSilently via offscreen:", cleanPath);
 
-  const attempt = async (path) => {
-    let id;
-    try {
-      id = await downloadsDownload({
-        url: dataUrl,
-        filename: path,
+  try {
+    // Ensure offscreen document exists
+    await ensureOffscreenDocument();
+
+    // Get blob URL from offscreen document
+    const blobResponse = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      op: 'createBlobUrl',
+      dataUrl: dataUrl,
+      id: requestId
+    });
+
+    console.log("Blob URL response:", JSON.stringify(blobResponse));
+
+    if (!blobResponse?.success || !blobResponse?.blobUrl) {
+      console.warn("Failed to create blob URL:", blobResponse?.error);
+      return false;
+    }
+
+    // Now download using the blob URL from background script
+    const downloadId = await new Promise((resolve, reject) => {
+      chrome.downloads.download({
+        url: blobResponse.blobUrl,
+        filename: cleanPath,
         conflictAction: "uniquify",
         saveAs: false
+      }, (id) => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+        } else {
+          resolve(id);
+        }
       });
-    } catch (err) {
-      console.warn("Silent save blocked or failed:", err);
-      return { started: false, success: false };
-    }
+    });
 
-    const outcome = await waitForCompletion(id, 20000);
-    if (!outcome.success) {
-      console.warn("Silent save did not complete:", outcome.reason || "unknown reason");
-      await downloadsCancel(id);
-      return { started: true, success: false };
-    }
+    console.log("Download started with id:", downloadId);
 
-    return { started: true, success: true };
-  };
+    // Wait for completion
+    const outcome = await waitForCompletion(downloadId, 20000);
+    console.log("Download outcome:", JSON.stringify(outcome));
 
-  let result = await attempt(primaryPath);
-  if (result.success) return true;
+    // Clean up blob URL
+    chrome.runtime.sendMessage({
+      target: 'offscreen',
+      op: 'revokeBlobUrl',
+      id: requestId
+    }).catch(() => {}); // Ignore errors
 
-  if (!result.started && fallbackPath && fallbackPath !== primaryPath) {
-    result = await attempt(fallbackPath);
-    if (result.success) return true;
+    return outcome.success;
+  } catch (err) {
+    console.warn("saveSilently failed:", err);
+    return false;
+  }
+}
+
+// Lock to prevent race condition when creating offscreen document
+let creatingOffscreen = null;
+
+// Create offscreen document if it doesn't exist
+async function ensureOffscreenDocument() {
+  const offscreenUrl = chrome.runtime.getURL('offscreen.html');
+
+  // Check if already exists
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [offscreenUrl]
+  });
+
+  if (existingContexts.length > 0) {
+    return; // Already exists
   }
 
-  return false;
+  // If already creating, wait for that to finish
+  if (creatingOffscreen) {
+    return creatingOffscreen;
+  }
+
+  // Create it (with lock to prevent race condition)
+  creatingOffscreen = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['BLOBS'],
+    justification: 'Convert data URLs to blob URLs for downloads with correct filenames'
+  });
+
+  try {
+    await creatingOffscreen;
+  } finally {
+    creatingOffscreen = null;
+  }
+}
+
+// Save original file directly from URL (no conversion)
+async function saveFromUrl(srcUrl, path) {
+  console.log("saveFromUrl called with path:", path);
+  try {
+    const id = await downloadsDownload({
+      url: srcUrl,
+      filename: path,
+      conflictAction: "uniquify",
+      saveAs: false
+    });
+    console.log("Download started with id:", id);
+
+    const outcome = await waitForCompletion(id, 20000);
+    console.log("Download outcome:", outcome);
+    if (!outcome.success) {
+      console.warn("URL save did not complete:", outcome.reason || "unknown");
+      await downloadsCancel(id);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn("URL save failed:", err);
+    return false;
+  }
 }
 
 // Promisified chrome.downloads APIs
