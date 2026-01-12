@@ -66,11 +66,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       blobToDataUrl(webpBlob)
     ]);
 
-    // Use content script to trigger downloads (anchor tag method respects filename)
-    const [originalOk, webpOk] = await Promise.all([
-      downloadViaContentScript(tab.id, originalDataUrl, `${base}.${originalExt}`, originalPath),
-      downloadViaContentScript(tab.id, webpDataUrl, `${base}.webp`, webpPath)
-    ]);
+    // Download sequentially (onDeterminingFilename only allows one listener at a time)
+    const originalOk = await downloadWithPath(tab.id, originalDataUrl, `${base}.${originalExt}`, originalPath);
+    const webpOk = await downloadWithPath(tab.id, webpDataUrl, `${base}.webp`, webpPath);
 
     if (originalOk && webpOk) {
       notify("Saved", `${base}.${originalExt} and ${base}.webp`);
@@ -179,7 +177,104 @@ function blobToDataUrl(blob) {
   });
 }
 
-// Download via content script using anchor tag (respects filename)
+// Download with correct filename AND path
+// Strategy: Listen for downloads, intercept and redirect to correct path
+async function downloadWithPath(tabId, dataUrl, filename, fullPath) {
+  console.log("downloadWithPath:", filename, "->", fullPath);
+
+  return new Promise(async (resolve) => {
+    let downloadId = null;
+    let handled = false;
+
+    // Set up listener to intercept the download and change its path
+    const determiningListener = (item, suggest) => {
+      console.log("onDeterminingFilename fired for:", item.filename);
+      // Check if this is our download (by filename)
+      if (item.filename.endsWith(filename) || item.filename.includes(filename.replace(/\.[^.]+$/, ''))) {
+        console.log("Intercepted download, redirecting to:", fullPath);
+        handled = true;
+        downloadId = item.id;
+        suggest({ filename: fullPath, conflictAction: 'uniquify' });
+      }
+    };
+
+    // Add the listener
+    chrome.downloads.onDeterminingFilename.addListener(determiningListener);
+    console.log("Listener added for:", filename);
+
+    // Set a timeout to clean up if download doesn't start
+    const timeout = setTimeout(() => {
+      console.log("Timeout reached for:", filename, "handled:", handled);
+      chrome.downloads.onDeterminingFilename.removeListener(determiningListener);
+      if (!handled) {
+        console.warn("Download interception timed out for:", filename);
+        resolve(false);
+      }
+    }, 10000);
+
+    try {
+      // Trigger the download via content script
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (dataUrl, filename) => {
+          return new Promise((resolve) => {
+            try {
+              fetch(dataUrl)
+                .then(res => res.blob())
+                .then(blob => {
+                  const blobUrl = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = blobUrl;
+                  a.download = filename;
+                  a.style.display = 'none';
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                  setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+                  resolve({ success: true });
+                })
+                .catch(err => resolve({ success: false, error: err.message }));
+            } catch (err) {
+              resolve({ success: false, error: err.message });
+            }
+          });
+        },
+        args: [dataUrl, filename]
+      });
+
+      console.log("Content script executed for:", filename);
+
+      // Wait longer for the download to be intercepted
+      let waitCount = 0;
+      while (!handled && waitCount < 20) {
+        await new Promise(r => setTimeout(r, 100));
+        waitCount++;
+      }
+      console.log("Waited", waitCount * 100, "ms for interception, handled:", handled);
+
+      // Clean up
+      clearTimeout(timeout);
+      chrome.downloads.onDeterminingFilename.removeListener(determiningListener);
+
+      if (handled && downloadId) {
+        // Wait for download to complete
+        const outcome = await waitForCompletion(downloadId, 20000);
+        console.log("Download outcome:", JSON.stringify(outcome));
+        resolve(outcome.success);
+      } else {
+        console.warn("Download was NOT intercepted for:", filename);
+        resolve(false);
+      }
+    } catch (err) {
+      clearTimeout(timeout);
+      chrome.downloads.onDeterminingFilename.removeListener(determiningListener);
+      console.warn("downloadWithPath failed:", err);
+      resolve(false);
+    }
+  });
+}
+
+// Download via content script using anchor tag (respects filename) - backup method
 async function downloadViaContentScript(tabId, dataUrl, filename, fullPath) {
   console.log("downloadViaContentScript:", filename, "->", fullPath);
 
