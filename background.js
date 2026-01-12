@@ -3,7 +3,7 @@
 const MENU_PARENT = "jaxplays_photos_parent";
 
 // Absolute paths for the renamed site; fallbacks stay relative to Chrome's download dir
-const SITE_ROOT = "Sites/jaxplays.org/";
+const SITE_ROOT = "/Users/rayhollister/Sites/jaxplays.org";
 const ASSET_ROOT = `${SITE_ROOT}/assets/media`;
 const STATIC_ROOT = `${SITE_ROOT}/static/media`;
 
